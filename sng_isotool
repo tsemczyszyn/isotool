@@ -1,0 +1,316 @@
+#!/usr/bin/perl
+
+use LWP::Simple;
+use Getopt::Long;
+use File::Path;
+use File::Copy;
+use Digest::MD5;
+
+#Command lines options
+my %options = ();
+my $version = '';
+my $project = '';
+my $url = $ARGV[0];
+my $iso = '';
+
+#I/O and signal handling
+$| = 1;
+$SIG{'INT'} = 'INT_handler';
+
+#static values 
+$TFTP_ROOT = '/tftpboot';
+$LOG = '/var/log/sng_isotool.log';
+
+open (LOG, ">>$LOG") or print "WARNING: Unable to open $LOG for logging.\n";
+GetOptions (\%options, 'version:s', 'project:s', 'md5:s', 'silent!');
+&validate_input;
+&fetch_iso;
+&create_dirs;
+&cook_initrd;
+&create_pxe_config;
+close(LOG);
+
+########################## Functions ##########################
+
+sub validate_input {
+
+	if ($url) {
+		$url =~ m/([^\/]*$)/;
+		$iso = $1;
+	}
+
+	else { &print_help; }
+
+	if (defined($options{version})) {
+		$version = $options{version};
+	}
+	else { &parse_version(); }
+
+	if ($options{project}) {
+		$project = uc($options{project});
+	}
+	else { &parse_project(); }
+
+}
+
+#Try to grab a major version number from the file name
+sub parse_version {
+
+	$iso =~ m/^.+?-(\d\.\d).*$/;
+	$version = $1;
+	unless ($version) {
+		die "Unable to determine version string from filename. Please try again with the \'--version\' flag.\n\n";
+	}
+}
+
+#Try to grab a project name from the file name
+sub parse_project {
+	
+	$iso =~ m/^(.+?)-.*$/;
+	$project = uc($1);
+	unless ($project) {
+		die "Unable to determine project string from filename. Please try again with the \'--version\' flag.\n\n";
+	}
+}
+
+#This is the help info we print if there weren't enough parameters to run
+sub print_help {
+	print <<EOF;
+
+
+Usage: sng_isotool [OPTIONS] <URL of ISO>	
+
+	--project <string> - Specifies the project name. If omitted, will attempt to parse from the filename
+	--version <string> - Specifies the project version. If omitted, will attempt to parse from the filename.
+
+
+EOF
+
+	exit(1);
+}
+
+#Fetch the ISO and place it in a temporary folder
+sub fetch_iso {
+	#if the TFTP directory does not exist, create one.	
+	mkpath ("$TFTP_ROOT/tmp") unless (-e "$TFTP_ROOT/tmp/"); 
+	logger ("Fetching $url.....");
+
+	$response = getstore($url, "$TFTP_ROOT/tmp/$iso");
+
+	unless ($response =~ m/^2/) {
+		logger ("HTTP ERROR $response while fetching $url. Exiting...\n");
+		exit(1);
+	}
+
+	logger ("Done.\n");
+
+	if (defined($options{md5})) {
+		logger ("MD5 Checksum requested. Checking.....");
+		open(FILE, "<$TFTP_ROOT/tmp/$iso");
+		binmode(FILE);
+		$md5 = Digest::MD5->new;
+		$md5->addfile(*FILE);
+		$digest = uc($md5->hexdigest);
+		unless ($digest eq uc($options{md5})) {
+			error_handler("Failed. MD5 checksum mismatch\n");
+		}
+		close(FILE);
+		logger ("Succeeded\n");
+	}
+}
+
+#Create the subdirs to hold the PXE images.
+sub create_dirs {
+	#if the project subdirectories don't exist in TFTP ROOT, create them.
+	mkpath ("$TFTP_ROOT/$project/$version/$iso") unless (-e "$TFTP_ROOT/$project/$version/$iso"); 
+}
+
+#We're going to mount the ISO, extract vmlinuz+initrd, then append the ISO to initrd.
+sub cook_initrd {
+
+	mkdir ("$TFTP_ROOT/tmp/$project");
+	logger ("Attempting to mount $iso to $TFTP_ROOT/tmp/$project.....");
+	system ("mount -o loop $TFTP_ROOT/tmp/$iso $TFTP_ROOT/tmp/$project 2>&1 >/dev/null");
+
+ 	error_handler("Mount failed.\n") unless ($? == 0);
+
+	logger ("Mount succeeded\n");
+	logger ("Copying boot files.....");
+	copy ("$TFTP_ROOT/tmp/$project/isolinux/vmlinuz", "$TFTP_ROOT/$project/$version/$iso/vmlinuz") or error_handler("Copy Failed.\n");
+	copy ("$TFTP_ROOT/tmp/$project/isolinux/initrd.img", "$TFTP_ROOT/$project/$version/$iso/initrd.img") or error_handler("Copy failed.\n");
+	logger ("Successful.\n");
+	logger ("Unmounting ISO.....");
+	system ("umount $TFTP_ROOT/tmp/$project 2>&1 > /dev/null");
+
+ 	error_handler( "Unmount failed.\n") unless ($? == 0);
+
+	logger ("Done.\n");
+	logger ("Appending ISO image to initrd.....");
+	move("$TFTP_ROOT/tmp/$iso", "$TFTP_ROOT/tmp/virtual-cdrom.iso");
+	# The Sangoma installer expects virtual-cdrom.iso to be in the / topmost directory
+	system ("cd $TFTP_ROOT/tmp/ && echo \"virtual-cdrom.iso\" | cpio -H newc --quiet -L -o | gzip -9 | cat $TFTP_ROOT/$project/$version/$iso/initrd.img - > $TFTP_ROOT/$project/$version/$iso/initrd.img_append");
+	logger ("Complete.\n");
+	move ("$TFTP_ROOT/$project/$version/$iso/initrd.img_append", "$TFTP_ROOT/$project/$version/$iso/initrd.img");
+	logger ("Cleaning up the tmp folder.....");
+	rmtree(["$TFTP_ROOT/tmp"]);
+	logger ("Done.\n");
+}
+
+sub create_pxe_config {
+
+	#read in all config files if they exist
+	if (-e "$TFTP_ROOT/pxelinux.cfg/default") {
+		open (DEF_CONF, "<$TFTP_ROOT/pxelinux.cfg/default");
+		@DEFAULT = <DEF_CONF>;
+		close (DEF_CONF);
+
+		foreach $line (@DEFAULT) {
+			if ($line =~ m/LABEL $project/) {
+				$default_exists = 1;
+			}
+		}
+	}
+ 	if (-e "$TFTP_ROOT/$project/$project.menu") {
+		open (PROJ_CONF, "<$TFTP_ROOT/$project/$project.menu");
+		@PROJ = <PROJ_CONF>;
+		close (PROJ_CONF);
+
+		foreach $line (@PROJ) {
+			if ($line =~ m/LABEL $version/) {
+				$project_exists = 1;
+			}
+		}
+	}
+	if (-e "$TFTP_ROOT/$project/$version/$version.menu") {
+		open (VER_CONF, "<$TFTP_ROOT/$project/$version/$version.menu");
+		@VER = <VER_CONF>;
+		close (VER_CONF);
+
+		foreach $line (@VER) {
+			if ($line =~ m/LABEL $iso/) {
+				$version_exists = 1;
+			}
+		}
+	}
+
+	unless (-e "$TFTP_ROOT/pxelinux.cfg/default") {
+		mkpath ("$TFTP_ROOT/pxelinux.cfg/");
+		open (FH, ">$TFTP_ROOT/pxelinux.cfg/default") or error_handler("Failed to open filehandle for writing.\n");
+		print FH <<EOF;
+DEFAULT /vesamenu.c32
+TIMEOUT 600
+ONTIMEOUT BootLocal
+PROMPT 0
+MENU INCLUDE pxelinux.cfg/pxe.conf
+NOESCAPE 1
+LABEL BootLocal
+        localboot 0
+        TEXT HELP
+        Boot to local hard disk
+ENDTEXT
+LABEL $project 
+	MENU LABEL $project
+	KERNEL vesamenu.c32
+	APPEND $project/$project.menu
+EOF
+		close (FH);
+	}
+	else {
+		unless ($default_exists) {
+			open (FH, ">>$TFTP_ROOT/pxelinux.cfg/default") or error_handler("Failed to open filehandle for writing.\n");
+			print FH <<EOF;
+LABEL $project 
+	MENU LABEL $project
+	KERNEL vesamenu.c32
+	APPEND $project/$project.menu
+
+EOF
+
+			close (FH);
+		}
+	}
+	unless (-e "$TFTP_ROOT/$project/$project.menu") {
+                mkpath ("$TFTP_ROOT/$project/");
+                open (FH, ">$TFTP_ROOT/$project/$project.menu") or error_handler("Failed to open filehandle for writing.\n");
+                print FH <<EOF;
+MENU INCLUDE /pxelinux.cfg/pxe.conf
+MENU TITLE $project 
+       LABEL Previous
+       MENU LABEL Previous Menu
+       TEXT HELP
+       Return to previous menu
+       ENDTEXT
+       MENU EXIT
+       LABEL $version 
+       KERNEL vesamenu.c32
+       APPEND /$project/$version/$version.menu
+EOF
+	}
+	else {
+
+		unless ($project_exists) {
+			open (FH, ">>$TFTP_ROOT/$project/$project.menu") or error_handler("Failed to open filehandle for writing.\n");
+			print FH <<EOF;
+       LABEL $version 
+       KERNEL vesamenu.c32
+       APPEND /$project/$version/$version.menu
+EOF
+		}
+	}
+	unless (-e "$TFTP_ROOT/$project/$version/$version.menu") {
+                mkpath ("$TFTP_ROOT/$project/$version/");
+                open (FH, ">$TFTP_ROOT/$project/$version/$version.menu") or error_handler("Failed to open filehandle for writing.\n");
+                print FH <<EOF;
+
+MENU INCLUDE /pxelinux.cfg/pxe.conf
+MENU TITLE $project
+LABEL $iso 
+       MENU LABEL $iso 
+       KERNEL $project/$version/$iso/vmlinuz
+       APPEND initrd=$project/$version/$iso/initrd.img 
+       TEXT HELP
+       Install $iso
+       ENDTEXT
+EOF
+	}
+	else {
+
+		unless ($version_exists) {
+			open (FH, ">>$TFTP_ROOT/$project/$version/$version.menu") or error_handler("Failed to open filehandle for writing.\n");
+			print FH <<EOF;
+LABEL $iso 
+       MENU LABEL $iso 
+       KERNEL $project/$version/$iso/vmlinuz
+       APPEND initrd=$project/$version/$iso/initrd.img 
+       TEXT HELP
+       Install $iso
+       ENDTEXT
+EOF
+		}
+	}
+}
+
+sub logger {
+	print LOG $_[0];
+	print $_[0] unless ($options{silent});
+}
+
+sub error_handler {
+	logger($_[0]);
+	&cleanup;
+	exit(1);
+}
+
+sub INT_handler {
+	&cleanup;
+        exit(0);
+}
+
+sub cleanup {
+
+	logger ("\n\nCleaning up before exiting...\n");
+ 	system ("umount $TFTP_ROOT/tmp/$project 2>&1 > /dev/null");
+	rmtree (["$TFTP_ROOT/tmp"]);
+
+	exit(1);
+}
